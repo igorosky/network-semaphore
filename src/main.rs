@@ -20,8 +20,11 @@ struct Args {
   #[arg(short, long, default_value_t = 9000)]
   port: u16,
   /// Listening timeout for the first holder in seconds
-  #[arg(short('t'), long, default_value_t = 300)]
+  #[arg(short('t'), long, default_value_t = 600)]
   initial_timeout: u64,
+  /// Shutdown delay in seconds
+  #[arg(short('d'), long, default_value_t = 300)]
+  shutdown_delay: u64,
   /// Acquire the semaphore
   #[arg(short('q'), long, default_value_t = false)]
   acquire: bool,
@@ -41,8 +44,9 @@ async fn run_server(args: Args) {
   let initial_timeout = args.initial_timeout;
   
   println!("Listening on {}:{}", address, port);
-  let mut server = NetworkSemaphoreServer::new(address, port, initial_timeout);
+  let mut server = NetworkSemaphoreServer::new(address, port, initial_timeout, args.shutdown_delay);
   server.start().await;
+  println!("Server shutdown initiated");
   system_shutdown::shutdown().expect("Failed to shutdown the OS");
 }
 

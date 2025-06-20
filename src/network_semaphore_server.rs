@@ -4,7 +4,7 @@ use tokio::{io::AsyncReadExt, net::{tcp::OwnedWriteHalf, TcpListener, TcpStream}
 use tokio::sync::Notify;
 use tokio::io::AsyncWriteExt;
 
-/**
+/*
  * Request
  * 0 - get
  * 1 - release
@@ -20,6 +20,8 @@ struct Shared {
   holders: DashSet<IpAddr>,
   finish_notify: Notify,
   finished: AtomicBool,
+  cancel: Notify,
+  shutdown_delay: u64,
 }
 
 pub struct NetworkSemaphoreServer {
@@ -30,7 +32,7 @@ pub struct NetworkSemaphoreServer {
 }
 
 impl NetworkSemaphoreServer {
-  pub fn new(address: String, port: u16, initial_timeout: u64) -> Self {
+  pub fn new(address: String, port: u16, initial_timeout: u64, shutdown_delay: u64) -> Self {
     Self {
       address,
       port,
@@ -39,6 +41,8 @@ impl NetworkSemaphoreServer {
         holders: DashSet::new(),
         finish_notify: Notify::new(),
         finished: AtomicBool::new(false),
+        cancel: Notify::new(),
+        shutdown_delay,
       }),
     }
   }
@@ -49,21 +53,30 @@ impl NetworkSemaphoreServer {
     shared.finish_notify.notify_waiters();
   }
   
-  fn initial_wait(&self) {
-    if self.initial_timeout == 0 {
-      return;
+  async fn delayed_shutdown(delay: u64, shared: Arc<Shared>) {
+    if delay == 0 {
+      Self::shutdown(shared).await;
+    } else {
+      tokio::spawn(async move {
+        println!("Waiting for {} seconds before shutdown", delay);
+        tokio::select! {
+          _ = shared.cancel.notified() => {
+            println!("Shutdown cancelled");
+          }
+          _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {
+            if shared.holders.is_empty() {
+              Self::shutdown(shared).await;
+            } else {
+              println!("Shutdown cancelled, holders still present");
+            }
+          },
+        }
+      });
     }
-    let initial_timeout = self.initial_timeout;
-    let shared = self.shared.clone();
-    tokio::spawn(async move {
-      tokio::time::sleep(std::time::Duration::from_secs(initial_timeout)).await;
-      if shared.holders.len() == 0 {
-        Self::shutdown(shared).await;
-      }
-    });
   }
 
   async fn handle_message(buf: &[u8], writer: &mut OwnedWriteHalf, address: SocketAddr, shared: Arc<Shared>) {
+    let mut acquire = false;
     let mut release = false;
     let send = if buf.len() != 1 {
       println!("Invalid packet from {}", address);
@@ -72,7 +85,8 @@ impl NetworkSemaphoreServer {
       match buf[0] {
         0 => {
           println!("Received acquire packet {}", address);
-          writer.write_all(&[!shared.holders.insert(address.ip()) as u8]).await
+          acquire = shared.holders.insert(address.ip());
+          writer.write_all(&[!acquire as u8]).await
         }
         1 => {
           println!("Received release packet from {}", address);
@@ -89,12 +103,16 @@ impl NetworkSemaphoreServer {
         }
       }
     };
-    if let Err(_) = send {
+    if send.is_err() {
       println!("Failed to send response to {}", address);
+      return;
+    }
+    if acquire {
+      shared.cancel.notify_waiters();
     }
     if release && shared.holders.is_empty() {
       println!("No more holders, shutting down");
-      Self::shutdown(shared).await;
+      Self::delayed_shutdown(shared.shutdown_delay, shared).await;
     }
   }
 
@@ -103,6 +121,10 @@ impl NetworkSemaphoreServer {
     let (mut reader, mut writer) = stream.into_split();
     loop {
       match reader.read_exact(&mut buf).await {
+        Err(err) if err.kind() == tokio::io::ErrorKind::UnexpectedEof => {
+          println!("Connection closed by {}", address.ip());
+          break;
+        }
         Err(err) => {
           println!("Failed while reading from {} ({})", address.ip(), err.kind());
           break;
@@ -123,6 +145,7 @@ impl NetworkSemaphoreServer {
           }
           let shared = shared.clone();
           tokio::spawn(async move {
+            println!("Accepted connection from {}", address.ip());
             tokio::select! {
               _ = Self::connection_handler(stream, address, shared.clone()) => (),
               _ = shared.finish_notify.notified() => (),
@@ -137,7 +160,9 @@ impl NetworkSemaphoreServer {
   pub async fn start(&mut self) {
     let listener = TcpListener::bind(format!("{}:{}", self.address, self.port)).await
       .expect("msg: Failed to bind TCP listener");
-    self.initial_wait();
+    if self.initial_timeout != 0 {
+      Self::delayed_shutdown(self.initial_timeout, self.shared.clone()).await;
+    }
     tokio::select! {
       _ = Self::connection_accepter(listener, self.shared.clone()) => (),
       _ = self.shared.finish_notify.notified() => (),
