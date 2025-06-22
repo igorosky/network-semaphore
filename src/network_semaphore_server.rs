@@ -94,15 +94,17 @@ impl NetworkSemaphoreServer {
           uuid
         };
         println!("Acquired UUID: {}, by {}", uuid, address.ip());
-        save_data(HOLDERS_FILE, &shared.holders).await
-          .map_err(|e| format!("Failed to save data: {}", e))?;
+        if let Err(err) = save_data(HOLDERS_FILE, &shared.holders).await {
+          println!("Failed to save data: {}", err);
+        }
         Ok(ResponsePacket::Success(uuid))
       }
       RequestPacket::Release(uuid) => {
         if shared.holders.remove(&uuid).is_some() {
           println!("Released UUID: {}, by {}", uuid, address.ip());
-          save_data(HOLDERS_FILE, &shared.holders).await
-            .map_err(|e| format!("Failed to save data: {}", e))?;
+          if let Err(err) = save_data(HOLDERS_FILE, &shared.holders).await {
+            println!("Failed to save data: {}", err);
+          }
           if shared.holders.is_empty() {
             Self::delayed_shutdown(shared.shutdown_delay, shared).await;
           }
@@ -193,7 +195,7 @@ impl NetworkSemaphoreServer {
   pub async fn start(&mut self) {
     let listener = TcpListener::bind(self.address).await
       .expect("msg: Failed to bind TCP listener");
-    if !self.initial_timeout.is_zero() {
+    if !self.initial_timeout.is_zero() && self.shared.holders.is_empty() {
       Self::delayed_shutdown(self.initial_timeout, self.shared.clone()).await;
     }
     tokio::select! {

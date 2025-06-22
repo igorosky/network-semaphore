@@ -99,21 +99,29 @@ impl Server {
   }
 
   pub async fn remove_lock(&mut self, uuid: &Uuid) -> std::io::Result<bool> {
+    let uuid_to_remove;
     match self.client.locks.get(&self.addr) {
       Some(v) => {
         let (k_uuid, uuids) = v.value();
         if uuids.remove(uuid).is_some() {
-          save_data(&self.client.file, &*self.client.locks).await?;
-          if uuids.is_empty() {
-            Self::get_connection(&mut self.connection, self.addr).await?.release(*k_uuid).await
+          uuid_to_remove = if uuids.is_empty() {
+            Some(*k_uuid)
           } else {
-            Ok(false)
-          }
+            None
+          };
         } else {
-          Err(Error::other(format!("Value not contained {}", uuid)))
+          return Err(Error::other(format!("Value not contained {}", uuid)));
         }
       }
-      None => Err(Error::other("No semaphore contained")),
+      None => {return Err(Error::other("No semaphore contained")); }
+    }
+    if let Some(k_uuid) = uuid_to_remove{
+      self.client.locks.remove(&self.addr);
+      save_data(&self.client.file, &*self.client.locks).await?;
+      Self::get_connection(&mut self.connection, self.addr).await?.release(k_uuid).await
+    } else {
+      save_data(&self.client.file, &*self.client.locks).await?;
+      Ok(false)
     }
   }
 
